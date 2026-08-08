@@ -1,0 +1,42 @@
+package com.example.meshchat
+
+import java.util.UUID
+
+/**
+ * Ek chat message.
+ * id -> har message ka unique ID (duplicate relay rokne ke liye, mesh mein ek message
+ *        multiple paths se wapas aa sakta hai, isliye dedup zaroori hai)
+ * senderName -> kisne bheja
+ * text -> message content
+ * timestamp -> kab bheja
+ * hopCount -> kitne devices se hokar aaya (debugging/limit ke liye, infinite loop na ho)
+ */
+data class Message(
+    val id: String = UUID.randomUUID().toString(),
+    val senderName: String,
+    val text: String,
+    val timestamp: Long = System.currentTimeMillis(),
+    var hopCount: Int = 0
+) {
+    // Message ko simple string format mein convert karna taaki Bluetooth se bhej sakein
+    fun serialize(): String {
+        return "$id|$senderName|$timestamp|$hopCount|$text"
+    }
+
+    companion object {
+        fun deserialize(data: String): Message? {
+            return try {
+                val parts = data.split("|", limit = 5)
+                Message(
+                    id = parts[0],
+                    senderName = parts[1],
+                    timestamp = parts[2].toLong(),
+                    hopCount = parts[3].toInt(),
+                    text = parts[4]
+                )
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+}
