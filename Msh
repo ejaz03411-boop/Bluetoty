@@ -1,0 +1,119 @@
+package com.example.meshchat
+
+import android.Manifest
+import android.os.Build
+import android.os.Bundle
+import android.widget.*
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+
+class MainActivity : AppCompatActivity(), MeshManager.MeshListener {
+
+    private lateinit var meshManager: MeshManager
+    private lateinit var adapter: ChatAdapter
+    private val messages = mutableListOf<Message>()
+
+    private lateinit var recyclerView: RecyclerView
+    private lateinit var editTextMessage: EditText
+    private lateinit var buttonSend: Button
+    private lateinit var textStatus: TextView
+
+    private val userName = "User-${(1000..9999).random()}" // real app mein user ye set kare
+
+    private val requiredPermissions = mutableListOf(
+        Manifest.permission.ACCESS_FINE_LOCATION,
+        Manifest.permission.BLUETOOTH,
+        Manifest.permission.BLUETOOTH_ADMIN
+    ).apply {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            add(Manifest.permission.BLUETOOTH_ADVERTISE)
+            add(Manifest.permission.BLUETOOTH_CONNECT)
+            add(Manifest.permission.BLUETOOTH_SCAN)
+        }
+    }.toTypedArray()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        recyclerView = findViewById(R.id.recyclerViewMessages)
+        editTextMessage = findViewById(R.id.editTextMessage)
+        buttonSend = findViewById(R.id.buttonSend)
+        textStatus = findViewById(R.id.textStatus)
+
+        adapter = ChatAdapter(messages)
+        recyclerView.layoutManager = LinearLayoutManager(this)
+        recyclerView.adapter = adapter
+
+        meshManager = MeshManager(this, userName, this)
+
+        buttonSend.setOnClickListener {
+            val text = editTextMessage.text.toString().trim()
+            if (text.isNotEmpty()) {
+                val myMessage = Message(senderName = userName, text = text)
+                messages.add(myMessage)
+                adapter.notifyItemInserted(messages.size - 1)
+                recyclerView.scrollToPosition(messages.size - 1)
+                meshManager.sendMessage(text)
+                editTextMessage.text.clear()
+            }
+        }
+
+        checkPermissionsAndStart()
+    }
+
+    private fun checkPermissionsAndStart() {
+        val missing = requiredPermissions.filter {
+            ActivityCompat.checkSelfPermission(this, it) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isEmpty()) {
+            startMesh()
+        } else {
+            ActivityCompat.requestPermissions(this, missing.toTypedArray(), 1)
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (grantResults.isNotEmpty() && grantResults.all { it == android.content.pm.PackageManager.PERMISSION_GRANTED }) {
+            startMesh()
+        } else {
+            Toast.makeText(this, "Bluetooth/Location permissions zaroori hain", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun startMesh() {
+        meshManager.startAdvertising()
+        meshManager.startDiscovery()
+        textStatus.text = "Searching for nearby devices..."
+    }
+
+    override fun onMessageReceived(message: Message) {
+        runOnUiThread {
+            messages.add(message)
+            adapter.notifyItemInserted(messages.size - 1)
+            recyclerView.scrollToPosition(messages.size - 1)
+        }
+    }
+
+    override fun onDeviceConnected(endpointId: String, deviceName: String) {
+        runOnUiThread {
+            textStatus.text = "Connected devices: ${meshManager.connectedDeviceCount()}"
+        }
+    }
+
+    override fun onDeviceDisconnected(endpointId: String) {
+        runOnUiThread {
+            textStatus.text = "Connected devices: ${meshManager.connectedDeviceCount()}"
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        meshManager.stopAll()
+    }
+}
