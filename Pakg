@@ -1,0 +1,170 @@
+package com.example.meshchat
+
+import android.content.Context
+import android.util.Log
+import com.google.android.gms.nearby.Nearby
+import com.google.android.gms.nearby.connection.*
+import java.nio.charset.Charset
+import java.util.Collections
+
+/**
+ * MeshManager: iska kaam hai
+ * 1. Nearby devices ko dhundna (discovery)
+ * 2. Nearby devices ko khud ka advertise karna (advertising)
+ * 3. Connection banana (dono taraf se)
+ * 4. Message bhejna aur relay karna (mesh logic)
+ *
+ * SERVICE_ID -> app ka unique identifier, sirf isi ID wale devices connect honge
+ * STRATEGY -> P2P_CLUSTER matlab many-to-many mesh (ek device se multiple connect ho sakte hain)
+ */
+class MeshManager(
+    private val context: Context,
+    private val userName: String,
+    private val listener: MeshListener
+) {
+    interface MeshListener {
+        fun onMessageReceived(message: Message)
+        fun onDeviceConnected(endpointId: String, deviceName: String)
+        fun onDeviceDisconnected(endpointId: String)
+    }
+
+    companion object {
+        private const val SERVICE_ID = "com.example.meshchat.SERVICE"
+        private val STRATEGY = Strategy.P2P_CLUSTER
+        private const val TAG = "MeshManager"
+        private const val MAX_HOPS = 8 // zyada dur tak relay na jaaye, warna network flood ho jayega
+    }
+
+    private val connectionsClient = Nearby.getConnectionsClient(context)
+
+    // Connected endpoints list (jinse hum directly Bluetooth se joint hain)
+    private val connectedEndpoints = Collections.synchronizedSet(mutableSetOf<String>())
+
+    // Pehle dekhe hue message IDs - duplicate relay rokne ke liye
+    private val seenMessageIds = Collections.synchronizedSet(mutableSetOf<String>())
+
+    // ---------- ADVERTISING: khud ko discoverable banana ----------
+    fun startAdvertising() {
+        val options = AdvertisingOptions.Builder().setStrategy(STRATEGY).build()
+        connectionsClient.startAdvertising(
+            userName, SERVICE_ID, connectionLifecycleCallback, options
+        ).addOnSuccessListener {
+            Log.d(TAG, "Advertising started")
+        }.addOnFailureListener {
+            Log.e(TAG, "Advertising failed: ${it.message}")
+        }
+    }
+
+    // ---------- DISCOVERY: nearby devices dhundna ----------
+    fun startDiscovery() {
+        val options = DiscoveryOptions.Builder().setStrategy(STRATEGY).build()
+        connectionsClient.startDiscovery(
+            SERVICE_ID, endpointDiscoveryCallback, options
+        ).addOnSuccessListener {
+            Log.d(TAG, "Discovery started")
+        }.addOnFailureListener {
+            Log.e(TAG, "Discovery failed: ${it.message}")
+        }
+    }
+
+    fun stopAll() {
+        connectionsClient.stopAdvertising()
+        connectionsClient.stopDiscovery()
+        connectionsClient.stopAllEndpoints()
+        connectedEndpoints.clear()
+    }
+
+    // ---------- Jab koi naya device mila (discovery callback) ----------
+    private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
+        override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
+            Log.d(TAG, "Endpoint found: $endpointId (${info.endpointName})")
+            connectionsClient.requestConnection(userName, endpointId, connectionLifecycleCallback)
+        }
+
+        override fun onEndpointLost(endpointId: String) {
+            Log.d(TAG, "Endpoint lost: $endpointId")
+        }
+    }
+
+    // ---------- Connection handshake handle karna ----------
+    private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
+        override fun onConnectionInitiated(endpointId: String, info: ConnectionInfo) {
+            // Auto-accept: real app mein yahan user se confirmation bhi le sakte ho
+            connectionsClient.acceptConnection(endpointId, payloadCallback)
+        }
+
+        override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
+            if (result.status.isSuccess) {
+                connectedEndpoints.add(endpointId)
+                listener.onDeviceConnected(endpointId, endpointId)
+                Log.d(TAG, "Connected to $endpointId")
+            } else {
+                Log.d(TAG, "Connection failed with $endpointId")
+            }
+        }
+
+        override fun onDisconnected(endpointId: String) {
+            connectedEndpoints.remove(endpointId)
+            listener.onDeviceDisconnected(endpointId)
+        }
+    }
+
+    // ---------- Jab message aaye (payload callback) ----------
+    private val payloadCallback = object : PayloadCallback() {
+        override fun onPayloadReceived(endpointId: String, payload: Payload) {
+            if (payload.type == Payload.Type.BYTES) {
+                val bytes = payload.asBytes() ?: return
+                val text = String(bytes, Charset.forName("UTF-8"))
+                val message = Message.deserialize(text) ?: return
+
+                // Agar ye message pehle nahi dekha, to UI mein dikhao aur relay karo
+                if (seenMessageIds.add(message.id)) {
+                    listener.onMessageReceived(message)
+                    relayMessage(message, excludeEndpoint = endpointId)
+                }
+                // Agar already dekha hua hai, to ignore karo (duplicate, mesh loop rokne ke liye)
+            }
+        }
+
+        override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {
+            // Progress tracking ke liye (large files ke case mein), text ke liye zaroori nahi
+        }
+    }
+
+    // ---------- Naya message bhejna (user ne khud type kiya) ----------
+    fun sendMessage(text: String) {
+        val message = Message(senderName = userName, text = text)
+        seenMessageIds.add(message.id) // apna khud ka message dobara relay na kare
+        broadcastToAll(message)
+    }
+
+    // ---------- Relay: doosre se aaya message aage forward karna (MESH ka core) ----------
+    private fun relayMessage(message: Message, excludeEndpoint: String) {
+        if (message.hopCount >= MAX_HOPS) return // zyada door tak flood na ho
+        message.hopCount += 1
+
+        val bytes = message.serialize().toByteArray(Charset.forName("UTF-8"))
+        val payload = Payload.fromBytes(bytes)
+
+        synchronized(connectedEndpoints) {
+            for (endpointId in connectedEndpoints) {
+                if (endpointId != excludeEndpoint) {
+                    connectionsClient.sendPayload(endpointId, payload)
+                }
+            }
+        }
+    }
+
+    // ---------- Sabko bhejna (broadcast) ----------
+    private fun broadcastToAll(message: Message) {
+        val bytes = message.serialize().toByteArray(Charset.forName("UTF-8"))
+        val payload = Payload.fromBytes(bytes)
+        synchronized(connectedEndpoints) {
+            for (endpointId in connectedEndpoints) {
+                connectionsClient.sendPayload(endpointId, payload)
+            }
+        }
+    }
+
+    fun connectedDeviceCount(): Int = connectedEndpoints.size
+}
